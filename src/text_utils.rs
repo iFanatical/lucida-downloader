@@ -7,18 +7,14 @@ pub fn sanitize_file_name(name: &str) -> String {
         .replace(['\\', '/', ':', '*', '?', '"', '<', '>', '|'], "_")
 }
 
-pub fn parse_enclosed_value<'a>(start_marker: &str, end_marker: &str, text: &'a str) -> &'a str {
-    let start_index = text
-        .find(start_marker)
-        .unwrap_or_else(|| panic!("{start_marker} not found in {text}"))
-        + start_marker.len();
-
-    let end_index = text[start_index..]
-        .find(end_marker)
-        .unwrap_or_else(|| panic!("{end_marker} not found in {text}"))
-        + start_index;
-
-    &text[start_index..end_index]
+pub fn parse_enclosed_value<'a>(
+    start_marker: &str,
+    end_marker: &str,
+    text: &'a str,
+) -> Option<&'a str> {
+    let start = text.find(start_marker)? + start_marker.len();
+    let end = text[start..].find(end_marker)? + start;
+    Some(&text[start..end])
 }
 
 pub fn format_track_stem(
@@ -30,16 +26,8 @@ pub fn format_track_stem(
     let track_number_and_artist = if is_grouped_single {
         Cow::Borrowed("")
     } else {
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss
-        )]
-        let track_number = track_number.map_or_else(String::new, |track_number| {
-            format!(
-                "{track_number:00$}. ",
-                (track_count as f32).log10().floor() as usize + 1
-            )
+        let track_number = track_number.map_or_else(String::new, |number| {
+            crate::numbering::format_prefix(number, track_count)
         });
 
         let artist = if let [artist, ..] = track.artists.as_slice() {
@@ -55,4 +43,18 @@ pub fn format_track_stem(
         "{track_number_and_artist}{}",
         sanitize_file_name(&track.title)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_enclosed_value;
+    #[test]
+    fn changed_or_truncated_pages_do_not_panic() {
+        assert_eq!(parse_enclosed_value("BEGIN", "END", "challenge page"), None);
+        assert_eq!(parse_enclosed_value("BEGIN", "END", "BEGINpartial"), None);
+        assert_eq!(
+            parse_enclosed_value("BEGIN", "END", "xBEGIN[1]ENDx"),
+            Some("[1]")
+        );
+    }
 }

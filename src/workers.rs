@@ -1,3 +1,5 @@
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,7 +32,7 @@ pub async fn run_album_worker(
             return;
         };
 
-        downloaders::download_album(
+        let operation = downloaders::download_album(
             client.clone(),
             &url,
             &output_path,
@@ -42,8 +44,20 @@ pub async fn run_album_worker(
             track_workers,
             skip,
             running.clone(),
-        )
-        .await;
+        );
+        let guarded = AssertUnwindSafe(operation).catch_unwind();
+        tokio::pin!(guarded);
+        let result = loop {
+            tokio::select! {
+                result = &mut guarded => break Some(result),
+                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    if !running.load(Ordering::Relaxed) { break None; }
+                }
+            }
+        };
+        if matches!(result, Some(Err(_))) {
+            tracing::error!("worker recovered from an unexpected item failure; continuing queue");
+        }
     }
 
     tracing::info!("stopped");
@@ -71,7 +85,7 @@ pub async fn run_track_worker(
             return;
         };
 
-        downloaders::request_and_download_track(
+        let operation = downloaders::request_and_download_track(
             client.clone(),
             service,
             &track,
@@ -83,7 +97,19 @@ pub async fn run_track_worker(
             &config,
             album_path.clone(),
             running.clone(),
-        )
-        .await;
+        );
+        let guarded = AssertUnwindSafe(operation).catch_unwind();
+        tokio::pin!(guarded);
+        let result = loop {
+            tokio::select! {
+                result = &mut guarded => break Some(result),
+                () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    if !running.load(Ordering::Relaxed) { break None; }
+                }
+            }
+        };
+        if matches!(result, Some(Err(_))) {
+            tracing::error!("worker recovered from an unexpected item failure; continuing queue");
+        }
     }
 }

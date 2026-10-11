@@ -10,6 +10,22 @@ pub const BASE_URL: &str = "https://lucida.to/";
 #[derive(Parser)]
 #[command(arg_required_else_help = true)]
 pub struct Cli {
+    /// Discover Amazon artist album URLs without downloading music
+    #[arg(long, value_name = "ARTIST_URL", conflicts_with_all = ["urls", "file"])]
+    pub discover_artist: Option<String>,
+
+    /// Save discovered URLs to a new text file (default: stdout)
+    #[arg(long, requires = "discover_artist", value_name = "FILE")]
+    pub save_list: Option<PathBuf>,
+
+    /// Include EPs and singles in artist discovery
+    #[arg(long, requires = "discover_artist")]
+    pub all_releases: bool,
+
+    /// Read an expanded Amazon artist page saved as HTML instead of fetching
+    #[arg(long, requires = "discover_artist", value_name = "HTML_FILE")]
+    pub artist_html: Option<PathBuf>,
+
     /// URLs to download
     pub urls: Vec<String>,
 
@@ -279,6 +295,7 @@ pub struct Track {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Album {
+    pub url: Option<String>,
     pub title: String,
     pub cover_artwork: Vec<CoverArtwork>,
     pub artists: Vec<Artist>,

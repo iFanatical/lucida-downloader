@@ -12,16 +12,60 @@ use tokio::{fs, time};
 use tracing::Instrument;
 
 use crate::models::{
-    AlbumInfo, AlbumYear, DownloadConfig, PageData, ResolveAlbumError, Service, SkipConfig, Track,
-    TrackDownload,
+    AlbumInfo, AlbumYear, DownloadConfig, Info, PageData, ResolveAlbumError, Service, SkipConfig,
+    Track, TrackDownload,
 };
+use crate::numbering::{self, DownloadName};
+use crate::report::{self, Item, Kind, Outcome};
 use crate::{requests, text_utils, workers};
 
-struct DownloadError;
+macro_rules! io_or_return {
+    ($item:ident, $operation:expr) => {
+        match $operation {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    "file operation failed ({}): {error}",
+                    stringify!($operation)
+                );
+                $item.fail(format!("file operation failed: {error}"));
+                return;
+            }
+        }
+    };
+}
+
+/// Removes a partial download unless it was promoted, including when the download is cancelled.
+struct PartFile {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl PartFile {
+    const fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn promoted(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[expect(
     clippy::too_many_arguments,
     reason = "this function is called from a single place"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "album resolution, standalone position recovery, and worker orchestration"
 )]
 pub async fn download_album(
     client: Client,
@@ -36,22 +80,46 @@ pub async fn download_album(
     skip: SkipConfig,
     running: Arc<AtomicBool>,
 ) {
-    let Some(page_data) = resolve_album(&client, url, &config, &running).await else {
-        return;
-    };
-
-    let album = match AlbumInfo::new(page_data.info, page_data.token) {
-        Ok(album) => album,
-        Err(err) => {
-            match err {
-                ResolveAlbumError::ArtistUrl { name } => {
-                    tracing::error!("cannot download URL pointing to an artist ({name})");
-                }
-            }
-
+    let mut item = Item::new(url, Kind::Album);
+    let page_data = match resolve_album(&client, url, &config, &running).await {
+        Ok(page_data) => page_data,
+        Err(error) => {
+            item.fail(error);
             return;
         }
     };
+
+    let recovered_position = if let Info::Track {
+        url: track_url,
+        album: Some(parent),
+        ..
+    } = &page_data.info
+    {
+        if let Some(parent_url) = parent.url.as_deref() {
+            resolve_album(&client, parent_url, &config, &running)
+                .await
+                .ok()
+                .and_then(|parent| numbering::album_position(&parent.info, track_url))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let mut album = match AlbumInfo::new(page_data.info, page_data.token) {
+        Ok(album) => album,
+        Err(ResolveAlbumError::ArtistUrl { name }) => {
+            tracing::error!("cannot download URL pointing to an artist ({name})");
+            item.fail(format!(
+                "URL points to an artist ({name}); use --discover-artist to list its albums"
+            ));
+            return;
+        }
+    };
+    if let Some((number, count)) = recovered_position {
+        album.tracks[0].0 = Some(number);
+        album.track_count = count;
+    }
 
     tracing::info!(
         "downloading album {} - {} with {} tracks",
@@ -98,7 +166,8 @@ pub async fn download_album(
         album_path
     };
 
-    fs::create_dir_all(&album_path).await.unwrap();
+    item.describe(&album_path, "album");
+    io_or_return!(item, fs::create_dir_all(&album_path).await);
 
     let tracks_len = album.tracks.len();
     let tracks = Arc::new(Mutex::new(album.tracks));
@@ -109,34 +178,35 @@ pub async fn download_album(
 
         tracing::info!("spawning {worker_count} track workers");
 
-        for result in future::join_all((1..=worker_count).map(|track_worker| {
-            tokio::spawn(
-                workers::run_track_worker(
-                    client.clone(),
-                    page_data.original_service,
-                    tracks.clone(),
-                    album.track_count,
-                    is_grouped_single,
-                    page_data.token_expiry,
-                    force_download,
-                    config.clone(),
-                    album_path.clone(),
-                    running.clone(),
-                )
-                .instrument(tracing::info_span!("track", track_worker)),
+        future::join_all((1..=worker_count).map(|track_worker| {
+            workers::run_track_worker(
+                client.clone(),
+                page_data.original_service,
+                tracks.clone(),
+                album.track_count,
+                is_grouped_single,
+                page_data.token_expiry,
+                force_download,
+                config.clone(),
+                album_path.clone(),
+                running.clone(),
             )
+            .instrument(tracing::info_span!("track", track_worker))
         }))
-        .await
-        {
-            result.unwrap();
-        }
+        .await;
     }
 
-    if skip.cover || is_grouped_single || !running.load(Ordering::Relaxed) {
+    if !running.load(Ordering::Relaxed) {
+        return;
+    }
+    item.finish(Outcome::Downloaded);
+    if skip.cover || is_grouped_single {
         return;
     }
 
-    download_album_cover(
+    let mut cover = Item::new(url, Kind::Cover);
+    cover.describe(&album_path, "cover.jpg");
+    let outcome = download_album_cover(
         client,
         &album.title,
         page_data.original_service,
@@ -146,6 +216,7 @@ pub async fn download_album(
         running,
     )
     .await;
+    cover.finish(outcome);
 }
 
 async fn resolve_album(
@@ -153,12 +224,18 @@ async fn resolve_album(
     url: &str,
     config: &DownloadConfig,
     running: &Arc<AtomicBool>,
-) -> Option<PageData> {
+) -> Result<PageData, String> {
     tracing::info!("resolving album {url}");
 
-    let html = loop {
+    let mut last_error = String::from("album page did not contain usable metadata");
+    for attempt in 0..3 {
+        if !running.load(Ordering::Relaxed) {
+            return Err("interrupted".into());
+        }
+        if attempt > 0 {
+            time::sleep(Duration::from_secs(5)).await;
+        }
         let html = requests::resolve_album(client, url, &config.country, running).await?;
-
         if let Some(error) = [
             "An error occured trying to process your request.",
             "Message: \"Cannot contact any valid server\"",
@@ -168,25 +245,26 @@ async fn resolve_album(
         .find(|&error| html.contains(error))
         {
             tracing::warn!("HTML contains error: {error}");
-
-            if !running.load(Ordering::Relaxed) {
-                return None;
-            }
-
-            time::sleep(Duration::from_secs(5)).await;
-        } else {
-            break html;
+            last_error = format!("lucida error: {error}");
+            continue;
         }
-    };
-
-    Some(
-        json5::from_str(text_utils::parse_enclosed_value(
+        let Some(data) = text_utils::parse_enclosed_value(
             ",{\"type\":\"data\",\"data\":",
             ",\"uses\":{\"url\":1}}];\n",
             &html,
-        ))
-        .unwrap(),
-    )
+        ) else {
+            tracing::warn!("missing album metadata for {url}");
+            continue;
+        };
+        match json5::from_str(data) {
+            Ok(data) => return Ok(data),
+            Err(error) => {
+                tracing::warn!("invalid album metadata for {url}: {error}");
+            }
+        }
+    }
+    tracing::error!("failed album {url} after 3 attempts");
+    Err(format!("{last_error} (after 3 attempts)"))
 }
 
 #[expect(
@@ -206,27 +284,39 @@ pub async fn request_and_download_track(
     album_path: Arc<PathBuf>,
     running: Arc<AtomicBool>,
 ) {
+    let mut item = Item::new(&track.url, Kind::Track);
+    let file_stem =
+        text_utils::format_track_stem(track, track_number, track_count, is_grouped_single);
+    item.describe(&album_path, &file_stem);
+    let infer_number = track_number.is_none() && !is_grouped_single;
+
     // HACK(jel): this seems to be the only way to detect tracks that are impossible
     // to download yet
     if matches!(service, Service::Qobuz if track.producers.is_none()) {
-        tracing::error!("skipping unavailable track {}", track.title);
+        tracing::warn!("skipping unavailable track {}", track.title);
+        item.finish(Outcome::Unavailable);
         return;
     }
 
-    let file_stem =
-        text_utils::format_track_stem(track, track_number, track_count, is_grouped_single);
-
     if !force_download {
-        let mut directory = fs::read_dir(album_path.as_path()).await.unwrap();
+        let mut directory = io_or_return!(item, fs::read_dir(album_path.as_path()).await);
 
-        while let Some(entry) = directory.next_entry().await.unwrap() {
-            if entry.file_type().await.unwrap().is_file()
+        while let Some(entry) = io_or_return!(item, directory.next_entry().await) {
+            // A standalone track may already exist under the number inferred on a previous run.
+            let matches = |stem: &str| {
+                stem == file_stem
+                    || (infer_number
+                        && numbering::numbered_suffix(stem)
+                            .is_some_and(|(_, rest)| rest == file_stem))
+            };
+            if io_or_return!(item, entry.file_type().await).is_file()
                 && entry
                     .path()
                     .file_stem()
-                    .is_some_and(|stem| stem.to_str().unwrap() == file_stem)
+                    .is_some_and(|stem| stem.to_str().is_some_and(matches))
             {
                 tracing::info!("track {} is already downloaded", track.title);
+                item.finish(Outcome::Existing);
                 return;
             }
         }
@@ -234,45 +324,86 @@ pub async fn request_and_download_track(
 
     tracing::info!("downloading track {}", track.title);
 
-    request_track_download(
+    let outcome = request_track_download(
         client,
         track,
-        &file_stem,
+        DownloadName {
+            stem: file_stem,
+            infer_number,
+            track_count,
+            force: force_download,
+        },
         token_expiry,
         config,
         album_path,
         running,
     )
     .await;
+    item.finish(outcome);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded job lifecycle with status diagnostics"
+)]
 async fn request_track_download(
     client: Client,
     track: &Track,
-    file_stem: &str,
+    name: DownloadName,
     token_expiry: u64,
     config: &DownloadConfig,
     album_path: Arc<PathBuf>,
     running: Arc<AtomicBool>,
-) {
-    'request_track_download: loop {
-        let Some(track_download) =
-            requests::request_track_download(&client, track, token_expiry, config, running.clone())
-                .await
-        else {
-            break;
+) -> Outcome {
+    let interrupted = || Outcome::Failed("interrupted".into());
+    let mut last_error = String::new();
+    'request_track_download: for attempt in 0..3 {
+        if !running.load(Ordering::Relaxed) {
+            return interrupted();
+        }
+        if attempt > 0 {
+            time::sleep(Duration::from_secs(5)).await;
+        }
+        let track_download = match requests::request_track_download(
+            &client,
+            track,
+            token_expiry,
+            config,
+            running.clone(),
+        )
+        .await
+        {
+            Ok(job) => job,
+            Err(requests::JobError::Unavailable) => return Outcome::Unavailable,
+            Err(requests::JobError::Failed(error)) => {
+                last_error = error;
+                break;
+            }
         };
 
         let mut last_status: Option<(String, String, Instant)> = None;
+        let started = Instant::now();
 
         loop {
-            let Some(track_download) =
-                requests::track_download_status(&client, &track_download).await
-            else {
+            if !running.load(Ordering::Relaxed) {
+                return interrupted();
+            }
+            if started.elapsed() >= Duration::from_mins(3) {
+                last_error = "lucida processing timed out after 3 minutes".into();
+                continue 'request_track_download;
+            }
+            let Some(track_download) = time::timeout(
+                Duration::from_mins(3).saturating_sub(started.elapsed()),
+                requests::track_download_status(&client, &track_download),
+            )
+            .await
+            .ok()
+            .flatten() else {
                 if !running.load(Ordering::Relaxed) {
-                    return;
+                    return interrupted();
                 }
 
+                last_error = "lost track of the lucida processing job".into();
                 continue 'request_track_download;
             };
 
@@ -288,7 +419,7 @@ async fn request_track_download(
 
                 last_status = Some((
                     track_download.status.clone(),
-                    track_download.message,
+                    track_download.message.clone(),
                     Instant::now(),
                 ));
             } else if let Some(last_status) = last_status.as_ref()
@@ -304,12 +435,34 @@ async fn request_track_download(
                 );
 
                 if !is_running {
-                    return;
+                    return interrupted();
                 }
 
+                last_error = format!(
+                    "lucida processing stuck on {}: {}",
+                    last_status.0,
+                    last_status.1.replace("{item}", &track.title)
+                );
                 continue 'request_track_download;
             }
 
+            if requests::unavailable(&track_download.message)
+                || track_download.status == "unavailable"
+            {
+                tracing::warn!("skipping unavailable track {}", track.title);
+                return Outcome::Unavailable;
+            }
+            if matches!(
+                track_download.status.as_str(),
+                "error" | "failed" | "cancelled"
+            ) {
+                last_error = format!(
+                    "lucida processing {}: {}",
+                    track_download.status,
+                    track_download.message.replace("{item}", &track.title)
+                );
+                continue 'request_track_download;
+            }
             if track_download.status == "completed" {
                 break;
             }
@@ -317,37 +470,43 @@ async fn request_track_download(
             time::sleep(Duration::from_secs(1)).await;
         }
 
-        let Ok(()) = download_track(
+        let outcome = download_track(
             client.clone(),
             track_download,
             album_path.clone(),
-            file_stem,
+            name.clone(),
             running.clone(),
         )
-        .await
-        else {
-            continue 'request_track_download;
-        };
-
-        break;
+        .await;
+        match outcome {
+            Outcome::Failed(error) => last_error = error,
+            outcome => return outcome,
+        }
     }
+    tracing::error!(
+        "failed track {} ({}) after retry budget exhausted",
+        track.title,
+        track.url
+    );
+    Outcome::Failed(last_error)
 }
 
 async fn download_track(
     client: Client,
     track_download: TrackDownload,
     album_path: Arc<PathBuf>,
-    file_stem: &str,
+    name: DownloadName,
     running: Arc<AtomicBool>,
-) -> Result<(), DownloadError> {
-    'download_track: loop {
-        let Some((mut rx, mime_type)) = requests::download_track(&client, &track_download).await
+) -> Outcome {
+    let result: std::io::Result<Outcome> = async {
+        let Some((mut rx, mime_type)) =
+            requests::download_track(&client, &track_download).await
         else {
             if !running.load(Ordering::Relaxed) {
-                break Ok(());
+                return Ok(Outcome::Failed("interrupted".into()));
             }
 
-            break Err(DownloadError);
+            return Ok(Outcome::Failed("audio download request failed".into()));
         };
 
         let file_extension = match mime_type
@@ -357,25 +516,48 @@ async fn download_track(
             "audio/flac" => "flac",
             "audio/mpeg" => "mp3",
             "audio/mp4" => "m4a",
-            _ => panic!("unsupported mime type {mime_type}"),
+            "audio/opus" => "opus",
+            _ => {
+                tracing::warn!("unsupported mime type {mime_type}");
+                return Ok(Outcome::Failed(format!("unsupported audio type {mime_type}")));
+            }
         };
 
-        let file_name = format!("{file_stem}.{file_extension}");
-        let part_path = album_path.join(format!("{file_name}.part"));
-        let mut file = BufWriter::new(File::create(&part_path).await.unwrap());
-
-        while let Some(result) = rx.recv().await {
-            match result {
-                Ok(chunk) => file.write_all(&chunk).await.unwrap(),
-                Err(()) => continue 'download_track,
+        let file_name = format!("{}.{file_extension}", name.stem);
+        let part = PartFile::new(album_path.join(format!("{file_name}.part")));
+        write_stream(&mut rx, &part.path).await?;
+        let final_stem = if !name.infer_number {
+            name.stem.clone()
+        } else if !numbering::ffprobe_available() {
+            report::warn(&album_path, &file_name, "kept unnumbered: ffprobe is not installed");
+            name.stem.clone()
+        } else {
+            match time::timeout(Duration::from_mins(1), numbering::standalone_stem(&part.path, &album_path, &name)).await.unwrap_or_else(|_| Err("Track-number inference timed out".into())) {
+                Ok(stem) => stem,
+                Err(error) => {
+                    tracing::warn!("could not number standalone track: {error}; retaining the unnumbered filename");
+                    report::warn(&album_path, &file_name, format!("kept unnumbered: {error}"));
+                    name.stem.clone()
+                }
             }
+        };
+        let final_path = album_path.join(format!("{final_stem}.{file_extension}"));
+        if !name.force && final_path.exists() {
+            tracing::warn!("numbered track already exists: {}", final_path.display());
+            return Ok(Outcome::Existing);
         }
+        fs::rename(&part.path, &final_path).await?;
+        part.promoted();
 
-        fs::rename(part_path, album_path.join(file_name))
-            .await
-            .unwrap();
-
-        break Ok(());
+        Ok(Outcome::Downloaded)
+    }
+    .await;
+    match result {
+        Ok(done) => done,
+        Err(error) => {
+            tracing::warn!("file operation failed: {error}");
+            Outcome::Failed(format!("file operation failed: {error}"))
+        }
     }
 }
 
@@ -387,50 +569,121 @@ pub async fn download_album_cover(
     force_download: bool,
     album_path: &Path,
     running: Arc<AtomicBool>,
-) {
+) -> Outcome {
     let cover_path = album_path.join("cover.jpg");
 
     if !force_download && cover_path.exists() {
         tracing::info!("{title} album cover is already downloaded");
-        return;
+        return Outcome::Existing;
     }
 
     tracing::info!("downloading {title} album cover");
 
     let url = match service {
-        Service::Qobuz => {
-            let stripped_url = url.strip_suffix(".jpg").unwrap();
-            let end_index = stripped_url.rfind('_').unwrap() + 1;
-            Cow::Owned(format!("{}org.jpg", &url[..end_index]))
-        }
+        Service::Qobuz => url
+            .strip_suffix(".jpg")
+            .and_then(|url| url.rfind('_'))
+            .map_or(Cow::Borrowed(url), |index| {
+                Cow::Owned(format!("{}org.jpg", &url[..=index]))
+            }),
         Service::Tidal | Service::Soundcloud | Service::Amazon => Cow::Borrowed(url),
     };
 
     let part_path = album_path.join("cover.jpg.part");
 
-    'download_album_cover: loop {
-        let Some(mut rx) = requests::download_album_cover(&client, &url, running.clone()).await
-        else {
-            return;
+    let mut last_error = String::new();
+    for attempt in 0..3 {
+        if !running.load(Ordering::Relaxed) {
+            return Outcome::Failed("interrupted".into());
+        }
+        if attempt > 0 {
+            time::sleep(Duration::from_secs(5)).await;
+        }
+        let mut rx = match requests::download_album_cover(&client, &url, running.clone()).await {
+            Ok(rx) => rx,
+            Err(error) => return Outcome::Failed(error),
         };
 
-        let mut file = BufWriter::new(File::create(&part_path).await.unwrap());
-
-        while let Some(chunk) = rx.recv().await {
-            if let Ok(chunk) = chunk {
-                file.write_all(&chunk).await.unwrap();
-            } else {
-                if !running.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                continue 'download_album_cover;
+        match save_stream(&mut rx, &part_path, &cover_path).await {
+            Ok(()) => return Outcome::Downloaded,
+            Err(error) => {
+                tracing::warn!("cover transfer failed: {error}");
+                last_error = format!("cover transfer failed: {error}");
             }
         }
-
-        file.flush().await.unwrap();
-        break;
     }
 
-    fs::rename(part_path, cover_path).await.unwrap();
+    tracing::error!("failed cover for {title} after 3 attempts");
+    Outcome::Failed(last_error)
+}
+
+/// Promote only a positively completed stream, after all buffered bytes reach the file.
+async fn save_stream(
+    rx: &mut tokio::sync::mpsc::Receiver<requests::StreamEvent>,
+    part_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<()> {
+    let part = PartFile::new(part_path.to_owned());
+    write_stream(rx, &part.path).await?;
+    fs::rename(&part.path, final_path).await?;
+    part.promoted();
+    Ok(())
+}
+
+async fn write_stream(
+    rx: &mut tokio::sync::mpsc::Receiver<requests::StreamEvent>,
+    part_path: &Path,
+) -> std::io::Result<()> {
+    let mut file = BufWriter::new(File::create(part_path).await?);
+    while let Some(event) = rx.recv().await {
+        match event {
+            requests::StreamEvent::Data(chunk) => file.write_all(&chunk).await?,
+            requests::StreamEvent::Finished => {
+                file.flush().await?;
+                drop(file);
+                return Ok(());
+            }
+            requests::StreamEvent::Failed => break,
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "download ended without successful completion",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use requests::StreamEvent;
+
+    #[tokio::test]
+    async fn flushes_tail_and_does_not_promote_interrupted_streams() {
+        let dir = std::env::temp_dir().join(format!("lucida-stream-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).await.unwrap();
+        let part = dir.join("audio.part");
+        let final_path = dir.join("audio.flac");
+        let payload = vec![123; 8193];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tx.send(StreamEvent::Data(payload.clone())).await.unwrap();
+        tx.send(StreamEvent::Finished).await.unwrap();
+        drop(tx);
+        save_stream(&mut rx, &part, &final_path).await.unwrap();
+        assert_eq!(fs::read(&final_path).await.unwrap(), payload);
+        for explicit_error in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            tx.send(StreamEvent::Data(vec![0; 7])).await.unwrap();
+            if explicit_error {
+                tx.send(StreamEvent::Failed).await.unwrap();
+            }
+            drop(tx);
+            assert!(save_stream(&mut rx, &part, &final_path).await.is_err());
+            assert_eq!(fs::read(&final_path).await.unwrap(), payload);
+            assert!(
+                !part.exists(),
+                "failed transfers must not leave .part files"
+            );
+        }
+        fs::remove_dir_all(dir).await.unwrap();
+    }
 }
