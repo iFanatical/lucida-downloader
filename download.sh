@@ -29,21 +29,7 @@ if ! command -v lucida >/dev/null 2>&1; then
     exit 1
 fi
 
-shopt -s nullglob
-list_args=()
-for file in "$lists_dir"/*.txt; do
-    [[ -f $file ]] || continue
-    if [[ ! -r $file ]]; then
-        printf 'Cannot read URL list: %s\n' "$file" >&2
-        exit 1
-    fi
-    # Prefix relative paths so a directory starting with '-' cannot become an option.
-    [[ $file == /* ]] || file="./$file"
-    list_args+=(-f "$file")
-done
-if [[ ${#list_args[@]} -eq 0 ]]; then
-    printf 'No .txt URL lists found in: %s\n' "$lists_dir" >&2
-    exit 1
-fi
-printf 'Downloading from %d URL list(s); music output directory: %s\n' "$(( ${#list_args[@]} / 2 ))" "$PWD" >&2
-exec lucida --cf-clearance "$1" --user-agent "$2" "${list_args[@]}"
+# Prefix relative paths so a directory starting with '-' cannot become an option.
+[[ $lists_dir == /* ]] || lists_dir="./$lists_dir"
+printf 'Downloading URL lists in %s; music output directory: %s\n' "$lists_dir" "$PWD" >&2
+exec lucida --cf-clearance "$1" --user-agent "$2" -f "$lists_dir"

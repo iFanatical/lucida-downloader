@@ -31,6 +31,9 @@ struct Report {
     unavailable: Vec<Entry>,
     warnings: Vec<Entry>,
 }
+/// File-name prefixes of the files saved by [`finish`].
+pub const SAVED_FILE_PREFIXES: [&str; 2] = ["lucida-report-", "lucida-failed-"];
+
 static REPORT: Mutex<Report> = Mutex::new(Report {
     downloaded: 0,
     existing: 0,
@@ -178,7 +181,7 @@ pub fn finish(output: &Path) -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let report_path = output.join(format!("lucida-report-{stamp}.txt"));
+    let report_path = output.join(format!("{}{stamp}.txt", SAVED_FILE_PREFIXES[0]));
     match std::fs::write(&report_path, &text) {
         Ok(()) => tracing::info!("Report saved to {}", report_path.display()),
         Err(error) => tracing::error!("Could not save report: {error}"),
@@ -193,7 +196,7 @@ pub fn finish(output: &Path) -> bool {
         .collect();
     urls.sort_unstable();
     urls.dedup();
-    let retry_path = output.join(format!("lucida-failed-{stamp}.txt"));
+    let retry_path = output.join(format!("{}{stamp}.txt", SAVED_FILE_PREFIXES[1]));
     match std::fs::write(&retry_path, urls.join("\n") + "\n") {
         Ok(()) => tracing::info!("Retry URLs saved to {} (use -f)", retry_path.display()),
         Err(error) => tracing::error!("Could not save retry URLs: {error}"),

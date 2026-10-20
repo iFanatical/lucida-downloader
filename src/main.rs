@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,8 +77,9 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     for url in &cli.urls {
-        if Path::new(url).is_file() {
-            tracing::error!("{url} is a file; pass it with -f/--file to read its URLs");
+        let path = Path::new(url);
+        if path.is_file() || path.is_dir() {
+            tracing::error!("{url} is a local path; pass it with -f/--file to read its URLs");
             return ExitCode::FAILURE;
         }
         if !valid_download_url(url) {
@@ -88,11 +89,33 @@ async fn main() -> ExitCode {
     }
     let mut urls = cli.urls;
 
-    for file in cli.file {
-        let file = match File::open(&file).await {
+    let mut files = Vec::new();
+    for path in cli.file {
+        if path.is_dir() {
+            match url_lists(&path).await {
+                Ok(lists) if lists.is_empty() => {
+                    tracing::error!("No .txt URL lists found in {}", path.display());
+                    return ExitCode::FAILURE;
+                }
+                Ok(lists) => {
+                    tracing::info!("reading {} URL lists from {}", lists.len(), path.display());
+                    files.extend(lists);
+                }
+                Err(error) => {
+                    tracing::error!("Cannot read directory {}: {error}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            files.push(path);
+        }
+    }
+
+    for path in files {
+        let file = match File::open(&path).await {
             Ok(file) => file,
             Err(error) => {
-                tracing::error!("Cannot open {}: {error}", file.display());
+                tracing::error!("Cannot open {}: {error}", path.display());
                 return ExitCode::FAILURE;
             }
         };
@@ -102,7 +125,7 @@ async fn main() -> ExitCode {
                 Ok(Some(line)) if !line.trim().is_empty() => {
                     let url = line.trim();
                     if !valid_download_url(url) {
-                        tracing::error!("Invalid URL in list: {url}");
+                        tracing::error!("Invalid URL in {}: {url}", path.display());
                         return ExitCode::FAILURE;
                     }
                     urls.push(url.to_owned());
@@ -110,7 +133,7 @@ async fn main() -> ExitCode {
                 Ok(Some(_)) => (),
                 Ok(None) => break,
                 Err(error) => {
-                    tracing::error!("Cannot read URL list: {error}");
+                    tracing::error!("Cannot read {}: {error}", path.display());
                     return ExitCode::FAILURE;
                 }
             }
@@ -252,7 +275,59 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Lists the `.txt` files directly inside `directory`, by name, leaving out this tool's own
+/// saved reports and retry lists.
+async fn url_lists(directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut lists = Vec::new();
+    let mut entries = tokio::fs::read_dir(directory).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let is_list = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"));
+        let is_saved_by_lucida =
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    report::SAVED_FILE_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                });
+        if is_list && !is_saved_by_lucida && tokio::fs::metadata(&path).await?.is_file() {
+            lists.push(path);
+        }
+    }
+    lists.sort();
+    Ok(lists)
+}
+
 fn valid_download_url(value: &str) -> bool {
     Url::parse(value)
         .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn directory_lists_are_sorted_txt_files_without_saved_reports() {
+        let directory =
+            std::env::temp_dir().join(format!("lucida-lists-test-{}", std::process::id()));
+        std::fs::create_dir_all(directory.join("nested.txt")).unwrap();
+        for name in [
+            "b.txt",
+            "A.TXT",
+            "notes.md",
+            "lucida-report-1.txt",
+            "lucida-failed-1.txt",
+        ] {
+            std::fs::write(directory.join(name), "").unwrap();
+        }
+        let lists = super::url_lists(&directory).await.unwrap();
+        let names: Vec<_> = lists
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["A.TXT", "b.txt"]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -29,8 +29,8 @@ pub struct Cli {
     /// URLs to download
     pub urls: Vec<String>,
 
-    /// files to read URLs from
-    #[arg(short, long)]
+    /// files to read URLs from; a directory reads every .txt file in it
+    #[arg(short, long, value_name = "FILE|DIR")]
     pub file: Vec<PathBuf>,
 
     /// custom path to download to

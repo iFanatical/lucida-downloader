@@ -33,7 +33,7 @@ Arguments:
   [URLS]...  URLs to download
 
 Options:
-  -f, --file <FILE>                    files to read URLs from
+  -f, --file <FILE|DIR>                files to read URLs from; a directory reads every .txt file in it
   -o, --output <OUTPUT>                custom path to download to
       --force                          overwrite already downloaded files
       --group-singles                  place all artist's singles in a "Singles" directory. their covers will not be downloaded
@@ -66,6 +66,12 @@ Review the file, then use it with the normal downloader:
 
 ```sh
 lucida --cf-clearance '<cookie>' --user-agent '<agent>' -f mazzy-star.txt
+```
+
+To download several lists in one run, put them in a directory and pass it to `-f`. Every `.txt` file directly inside it is read, in name order; the tool's own `lucida-report-*` and `lucida-failed-*` files are skipped:
+
+```sh
+lucida --cf-clearance '<cookie>' --user-agent '<agent>' -f lists/
 ```
 
 By default discovery includes albums. Add `--all-releases` to include singles and EPs. URLs are deduplicated by Amazon album ID; alternate editions with different IDs are retained for review. Titles and release types go to stderr. Without `--save-list`, stdout contains only URLs. Existing list files are never overwritten.
