@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future;
-use reqwest::Client;
+use reqwest::{Client, Response};
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::{fs, time};
@@ -161,7 +161,11 @@ pub async fn download_album(
         };
 
         let mut album_path = PathBuf::from(output_path);
-        album_path.extend(album_directory);
+        album_path.extend(
+            album_directory
+                .into_iter()
+                .map(|name| text_utils::path_component(name, text_utils::MAX_COMPONENT_BYTES)),
+        );
 
         album_path
     };
@@ -203,6 +207,11 @@ pub async fn download_album(
     if skip.cover || is_grouped_single {
         return;
     }
+    let Some(cover_artwork_url) = &album.cover_artwork_url else {
+        tracing::warn!("{} has no cover artwork", album.title);
+        report::warn(&album_path, "cover.jpg", "lucida listed no cover artwork");
+        return;
+    };
 
     let mut cover = Item::new(url, Kind::Cover);
     cover.describe(&album_path, "cover.jpg");
@@ -210,7 +219,7 @@ pub async fn download_album(
         client,
         &album.title,
         page_data.original_service,
-        &album.cover_artwork_url,
+        cover_artwork_url,
         force_download,
         &album_path,
         running,
@@ -364,22 +373,17 @@ async fn request_track_download(
         if attempt > 0 {
             time::sleep(Duration::from_secs(5)).await;
         }
-        let track_download = match requests::request_track_download(
-            &client,
-            track,
-            token_expiry,
-            config,
-            running.clone(),
-        )
-        .await
-        {
-            Ok(job) => job,
-            Err(requests::JobError::Unavailable) => return Outcome::Unavailable,
-            Err(requests::JobError::Failed(error)) => {
-                last_error = error;
-                break;
-            }
-        };
+        let track_download =
+            match requests::request_track_download(&client, track, token_expiry, config, &running)
+                .await
+            {
+                Ok(job) => job,
+                Err(requests::JobError::Unavailable) => return Outcome::Unavailable,
+                Err(requests::JobError::Failed(error)) => {
+                    last_error = error;
+                    break;
+                }
+            };
 
         let mut last_status: Option<(String, String, Instant)> = None;
         let started = Instant::now();
@@ -394,7 +398,7 @@ async fn request_track_download(
             }
             let Some(track_download) = time::timeout(
                 Duration::from_mins(3).saturating_sub(started.elapsed()),
-                requests::track_download_status(&client, &track_download),
+                requests::track_download_status(&client, &track_download, &running),
             )
             .await
             .ok()
@@ -499,8 +503,8 @@ async fn download_track(
     running: Arc<AtomicBool>,
 ) -> Outcome {
     let result: std::io::Result<Outcome> = async {
-        let Some((mut rx, mime_type)) =
-            requests::download_track(&client, &track_download).await
+        let Some((mut response, mime_type)) =
+            requests::download_track(&client, &track_download, &running).await
         else {
             if !running.load(Ordering::Relaxed) {
                 return Ok(Outcome::Failed("interrupted".into()));
@@ -525,7 +529,10 @@ async fn download_track(
 
         let file_name = format!("{}.{file_extension}", name.stem);
         let part = PartFile::new(album_path.join(format!("{file_name}.part")));
-        write_stream(&mut rx, &part.path).await?;
+        if let Err(error) = write_stream(&mut response, &part.path).await {
+            tracing::warn!("audio transfer failed: {error}");
+            return Ok(Outcome::Failed(format!("audio transfer failed: {error}")));
+        }
         let final_stem = if !name.infer_number {
             name.stem.clone()
         } else if !numbering::ffprobe_available() {
@@ -599,12 +606,12 @@ pub async fn download_album_cover(
         if attempt > 0 {
             time::sleep(Duration::from_secs(5)).await;
         }
-        let mut rx = match requests::download_album_cover(&client, &url, running.clone()).await {
-            Ok(rx) => rx,
+        let mut response = match requests::download_album_cover(&client, &url, &running).await {
+            Ok(response) => response,
             Err(error) => return Outcome::Failed(error),
         };
 
-        match save_stream(&mut rx, &part_path, &cover_path).await {
+        match save_stream(&mut response, &part_path, &cover_path).await {
             Ok(()) => return Outcome::Downloaded,
             Err(error) => {
                 tracing::warn!("cover transfer failed: {error}");
@@ -617,45 +624,57 @@ pub async fn download_album_cover(
     Outcome::Failed(last_error)
 }
 
-/// Promote only a positively completed stream, after all buffered bytes reach the file.
+/// Promote only a completely received body, after all buffered bytes reach the file.
 async fn save_stream(
-    rx: &mut tokio::sync::mpsc::Receiver<requests::StreamEvent>,
+    response: &mut Response,
     part_path: &Path,
     final_path: &Path,
 ) -> std::io::Result<()> {
     let part = PartFile::new(part_path.to_owned());
-    write_stream(rx, &part.path).await?;
+    write_stream(response, &part.path).await?;
     fs::rename(&part.path, final_path).await?;
     part.promoted();
     Ok(())
 }
 
-async fn write_stream(
-    rx: &mut tokio::sync::mpsc::Receiver<requests::StreamEvent>,
-    part_path: &Path,
-) -> std::io::Result<()> {
+/// Fails if the body ends early, which reqwest detects from Content-Length or chunked
+/// framing.
+async fn write_stream(response: &mut Response, part_path: &Path) -> std::io::Result<()> {
     let mut file = BufWriter::new(File::create(part_path).await?);
-    while let Some(event) = rx.recv().await {
-        match event {
-            requests::StreamEvent::Data(chunk) => file.write_all(&chunk).await?,
-            requests::StreamEvent::Finished => {
-                file.flush().await?;
-                drop(file);
-                return Ok(());
-            }
-            requests::StreamEvent::Failed => break,
-        }
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| std::io::Error::other(error.without_url()))?
+    {
+        file.write_all(&chunk).await?;
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::UnexpectedEof,
-        "download ended without successful completion",
-    ))
+    file.flush().await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+
     use super::*;
-    use requests::StreamEvent;
+
+    /// Serves one raw HTTP response and returns the client's view of it.
+    async fn serve(raw: Vec<u8>) -> Response {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = socket.read(&mut [0; 4096]);
+            socket.write_all(&raw).unwrap();
+        });
+        Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
 
     #[tokio::test]
     async fn flushes_tail_and_does_not_promote_interrupted_streams() {
@@ -664,20 +683,22 @@ mod tests {
         let part = dir.join("audio.part");
         let final_path = dir.join("audio.flac");
         let payload = vec![123; 8193];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        tx.send(StreamEvent::Data(payload.clone())).await.unwrap();
-        tx.send(StreamEvent::Finished).await.unwrap();
-        drop(tx);
-        save_stream(&mut rx, &part, &final_path).await.unwrap();
+        let mut complete = b"HTTP/1.1 200 OK\r\nContent-Length: 8193\r\n\r\n".to_vec();
+        complete.extend_from_slice(&payload);
+        save_stream(&mut serve(complete).await, &part, &final_path)
+            .await
+            .unwrap();
         assert_eq!(fs::read(&final_path).await.unwrap(), payload);
-        for explicit_error in [false, true] {
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            tx.send(StreamEvent::Data(vec![0; 7])).await.unwrap();
-            if explicit_error {
-                tx.send(StreamEvent::Failed).await.unwrap();
-            }
-            drop(tx);
-            assert!(save_stream(&mut rx, &part, &final_path).await.is_err());
+        for truncated in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 8193\r\n\r\n0000000"[..],
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n0000000\r\n",
+        ] {
+            let mut response = serve(truncated.to_vec()).await;
+            assert!(
+                save_stream(&mut response, &part, &final_path)
+                    .await
+                    .is_err()
+            );
             assert_eq!(fs::read(&final_path).await.unwrap(), payload);
             assert!(
                 !part.exists(),

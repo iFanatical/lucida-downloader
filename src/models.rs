@@ -125,7 +125,7 @@ pub struct SkipConfig {
 pub struct AlbumInfo {
     pub title: String,
     pub release_year: Option<u16>,
-    pub cover_artwork_url: String,
+    pub cover_artwork_url: Option<String>,
     pub artist_name: String,
     pub tracks: Vec<(Option<u32>, Track)>,
     pub track_count: u32,
@@ -136,44 +136,30 @@ impl AlbumInfo {
         match info {
             Info::Album {
                 title,
-                mut cover_artwork,
-                mut artists,
+                cover_artwork,
+                artists,
                 track_count,
                 release_date,
                 tracks,
             } => Ok(Self {
                 title,
-                release_year: Some(release_date.year().try_into().unwrap()),
-                cover_artwork_url: cover_artwork.pop().unwrap().url,
-                artist_name: if artists.is_empty() {
-                    "Unknown".into()
-                } else {
-                    artists.swap_remove(0).name
-                },
-                tracks: tracks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, track)| (Some(u32::try_from(i).unwrap() + 1), track))
-                    .rev()
-                    .collect(),
+                release_year: year(release_date),
+                cover_artwork_url: last_cover(cover_artwork),
+                artist_name: first_artist(artists),
+                tracks: numbered(tracks),
                 track_count,
             }),
             Info::Playlist {
                 title,
-                mut cover_artwork,
+                cover_artwork,
                 track_count,
                 tracks,
             } => Ok(Self {
                 title,
                 release_year: None,
-                cover_artwork_url: cover_artwork.pop().unwrap().url,
+                cover_artwork_url: last_cover(cover_artwork),
                 artist_name: "Playlists".into(),
-                tracks: tracks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, track)| (Some(u32::try_from(i).unwrap() + 1), track))
-                    .rev()
-                    .collect(),
+                tracks: numbered(tracks),
                 track_count,
             }),
             Info::Track {
@@ -181,49 +167,83 @@ impl AlbumInfo {
                 title,
                 cover_artwork,
                 artists,
-                mut album,
+                album,
                 release_date,
                 producers,
-            } => Ok(Self {
-                title: album
-                    .as_ref()
-                    .map_or_else(|| title.clone(), |album| album.title.clone()),
-                release_year: Some(
-                    album
-                        .as_ref()
-                        .map_or_else(|| release_date.unwrap(), |album| album.release_date)
-                        .year()
-                        .try_into()
-                        .unwrap(),
-                ),
-                cover_artwork_url: album
-                    .as_mut()
-                    .map_or_else(
-                        || cover_artwork.unwrap().pop(),
-                        |album| album.cover_artwork.pop(),
-                    )
-                    .unwrap()
-                    .url,
-                artist_name: album
-                    .as_mut()
-                    .map_or_else(|| artists[0].clone(), |album| album.artists.swap_remove(0))
-                    .name,
-                tracks: vec![(
-                    None,
-                    Track {
-                        title,
-                        url,
-                        artists,
-                        producers,
-                        csrf: token,
-                        csrf_fallback: None,
-                    },
-                )],
-                track_count: album.and_then(|album| album.track_count).unwrap_or(1),
-            }),
+            } => {
+                let track_cover = cover_artwork.and_then(last_cover);
+                let track_artist = artists.first().map(|artist| artist.name.clone());
+                let (album_title, release_year, cover_artwork_url, artist_name, track_count) =
+                    match album {
+                        Some(album) => (
+                            album.title,
+                            year(album.release_date),
+                            last_cover(album.cover_artwork).or(track_cover),
+                            album
+                                .artists
+                                .into_iter()
+                                .next()
+                                .map(|artist| artist.name)
+                                .or(track_artist),
+                            album.track_count.unwrap_or(1),
+                        ),
+                        None => (
+                            title.clone(),
+                            release_date.and_then(year),
+                            track_cover,
+                            track_artist,
+                            1,
+                        ),
+                    };
+                Ok(Self {
+                    title: album_title,
+                    release_year,
+                    cover_artwork_url,
+                    artist_name: artist_name.unwrap_or_else(|| UNKNOWN_ARTIST.into()),
+                    tracks: vec![(
+                        None,
+                        Track {
+                            title,
+                            url,
+                            artists,
+                            producers,
+                            csrf: token,
+                            csrf_fallback: None,
+                        },
+                    )],
+                    track_count,
+                })
+            }
             Info::Artist { name } => Err(ResolveAlbumError::ArtistUrl { name }),
         }
     }
+}
+
+const UNKNOWN_ARTIST: &str = "Unknown";
+
+fn year(date: OffsetDateTime) -> Option<u16> {
+    date.year().try_into().ok()
+}
+
+fn last_cover(mut covers: Vec<CoverArtwork>) -> Option<String> {
+    covers.pop().map(|cover| cover.url)
+}
+
+fn first_artist(artists: Vec<Artist>) -> String {
+    artists
+        .into_iter()
+        .next()
+        .map_or_else(|| UNKNOWN_ARTIST.into(), |artist| artist.name)
+}
+
+/// Numbers tracks from 1, reversed so workers pop them in album order.
+fn numbered(tracks: Vec<Track>) -> Vec<(Option<u32>, Track)> {
+    let mut tracks: Vec<_> = (1..)
+        .zip(tracks)
+        .map(|(number, track)| (Some(number), track))
+        .collect();
+    tracks.reverse();
+    tracks
 }
 
 #[derive(Deserialize)]

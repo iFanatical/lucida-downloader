@@ -1,12 +1,9 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
-use reqwest::{Client, StatusCode, Url};
-use tokio::sync::mpsc::{self, Receiver};
+use reqwest::{Client, RequestBuilder, Response, StatusCode, Url};
 use tokio::time;
-use tracing::Instrument;
 
 use crate::models::{
     Account, Availability, DownloadConfig, Token, Track, TrackDownload, TrackDownloadRequest,
@@ -19,14 +16,69 @@ pub enum JobError {
     Failed(String),
 }
 
-pub enum StreamEvent {
-    Data(Vec<u8>),
-    Finished,
-    Failed,
+/// What to do with a successful response.
+enum Next<T> {
+    Done(T),
+    Retry(String),
 }
 
-const IRRECOVERABLE_STATUS_CODES: [StatusCode; 2] =
-    [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR];
+const ATTEMPTS: u32 = 3;
+
+/// A processing job that answers with these is gone; the caller must start a new one.
+const DEAD_JOB_STATUS_CODES: [StatusCode; 1] = [StatusCode::INTERNAL_SERVER_ERROR];
+
+/// Client errors that a retry of the same request cannot fix.
+const fn is_terminal(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422)
+}
+
+/// Sends a request up to three times with 2/4-second backoff, retrying transport errors,
+/// non-terminal statuses, and responses that `on_ok` asks to retry.
+async fn with_retries<T, F: Future<Output = Next<T>>>(
+    what: &str,
+    running: &AtomicBool,
+    stop_on: &[StatusCode],
+    request: impl Fn() -> RequestBuilder,
+    mut on_ok: impl FnMut(Response) -> F,
+) -> Result<T, String> {
+    let mut last_error = format!("{what} got no response");
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            if !running.load(Ordering::Relaxed) {
+                return Err("interrupted".into());
+            }
+            time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+        }
+        let response = match request().send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("{what} failed: {}", error.without_url());
+                tracing::warn!("{last_error}");
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status == StatusCode::OK {
+            match on_ok(response).await {
+                Next::Done(value) => return Ok(value),
+                Next::Retry(error) => {
+                    tracing::warn!("{error}");
+                    last_error = error;
+                }
+            }
+            continue;
+        }
+
+        last_error = format!("{what} returned HTTP {status}");
+        if is_terminal(status) || stop_on.contains(&status) {
+            tracing::info!("{last_error}; not retrying");
+            return Err(last_error);
+        }
+        tracing::warn!("{last_error}");
+    }
+    Err(last_error)
+}
 
 pub async fn check_availability(client: &Client) -> Availability {
     let Ok(response) = client.get("https://lucida.to/").send().await else {
@@ -44,55 +96,30 @@ pub async fn resolve_album(
     client: &Client,
     url: &str,
     country: &str,
-    running: &Arc<AtomicBool>,
+    running: &AtomicBool,
 ) -> Result<String, String> {
-    let mut last_error = String::from("no response");
-    for attempt in 0..3 {
-        if attempt > 0 {
-            time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-        }
-        let response = client
-            .get(
-                Url::parse_with_params("https://lucida.to/", &[("url", url), ("country", country)])
-                    .unwrap(),
-            )
-            .timeout(Duration::from_secs(45))
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("request failed: {}", error.without_url());
-                tracing::warn!("{last_error}");
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422) {
-            tracing::info!("request stopped: HTTP {status}");
-            return Err(format!("lucida returned HTTP {status}"));
-        }
-
-        if status == StatusCode::OK {
+    let request_url =
+        Url::parse_with_params("https://lucida.to/", &[("url", url), ("country", country)])
+            .unwrap();
+    with_retries(
+        "album request",
+        running,
+        &[],
+        || {
+            client
+                .get(request_url.clone())
+                .timeout(Duration::from_secs(45))
+        },
+        |response| async move {
             match response.text().await {
-                Ok(html) => return Ok(html),
+                Ok(html) => Next::Done(html),
                 Err(error) => {
-                    last_error = format!("album response failed: {}", error.without_url());
-                    tracing::warn!("{last_error}");
-                    continue;
+                    Next::Retry(format!("album response failed: {}", error.without_url()))
                 }
             }
-        }
-
-        last_error = format!("lucida returned HTTP {status}");
-        tracing::info!("received code {} when resolving album", status.as_u16());
-
-        if !running.load(Ordering::Relaxed) {
-            return Err("interrupted".into());
-        }
-    }
-    Err(last_error)
+        },
+    )
+    .await
 }
 
 pub async fn request_track_download(
@@ -100,155 +127,94 @@ pub async fn request_track_download(
     track: &Track,
     token_expiry: u64,
     config: &DownloadConfig,
-    running: Arc<AtomicBool>,
+    running: &AtomicBool,
 ) -> Result<TrackDownload, JobError> {
-    let mut last_error = String::from("no response");
-    for attempt in 0..3 {
-        if attempt > 0 {
-            time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-        }
-        let response = client
-            .post("https://lucida.to/api/load?url=%2Fapi%2Ffetch%2Fstream%2Fv2")
-            .json(&TrackDownloadRequest {
-                account: Account {
-                    id: &config.country,
-                    r#type: "country",
-                },
-                compat: false,
-                downscale: "original",
-                handoff: true,
-                metadata: config.metadata,
-                private: config.private,
-                token: Token {
-                    expiry: token_expiry,
-                    primary: track.csrf.as_deref(),
-                    secondary: track.csrf_fallback.as_deref(),
-                },
-                upload: Upload { enabled: false },
-                url: &track.url,
-            })
-            .timeout(Duration::from_secs(45))
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("job request failed: {}", error.without_url());
-                tracing::warn!("{last_error}");
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422) {
-            tracing::info!("request stopped: HTTP {status}");
-            return Err(JobError::Failed(format!(
-                "job request returned HTTP {status}"
-            )));
-        }
-
-        if status == StatusCode::OK {
-            if let Ok(track_download) = response.json().await {
-                match track_download {
-                    TrackDownloadResult::Ok(track_download) => return Ok(track_download),
-                    TrackDownloadResult::Error { error, .. } => {
-                        tracing::warn!("error when requesting track download: {error}");
-                        last_error = format!("lucida error: {error}");
-                        if unavailable(&error) {
-                            tracing::warn!("skipping unavailable track {}", track.title);
-                            return Err(JobError::Unavailable);
-                        }
-
-                        if !running.load(Ordering::Relaxed) {
-                            return Err(JobError::Failed("interrupted".into()));
-                        }
-                    }
+    with_retries(
+        "job request",
+        running,
+        &[],
+        || {
+            client
+                .post("https://lucida.to/api/load?url=%2Fapi%2Ffetch%2Fstream%2Fv2")
+                .json(&TrackDownloadRequest {
+                    account: Account {
+                        id: &config.country,
+                        r#type: "country",
+                    },
+                    compat: false,
+                    downscale: "original",
+                    handoff: true,
+                    metadata: config.metadata,
+                    private: config.private,
+                    token: Token {
+                        expiry: token_expiry,
+                        primary: track.csrf.as_deref(),
+                        secondary: track.csrf_fallback.as_deref(),
+                    },
+                    upload: Upload { enabled: false },
+                    url: &track.url,
+                })
+                .timeout(Duration::from_secs(45))
+        },
+        |response| async move {
+            match response.json().await {
+                Ok(TrackDownloadResult::Ok(track_download)) => Next::Done(Ok(track_download)),
+                Ok(TrackDownloadResult::Error { error }) if unavailable(&error) => {
+                    tracing::warn!("skipping unavailable track {}: {error}", track.title);
+                    Next::Done(Err(JobError::Unavailable))
                 }
-            } else {
-                tracing::warn!("invalid JSON when requesting track download");
-                last_error = "invalid job response".into();
-
-                if !running.load(Ordering::Relaxed) {
-                    return Err(JobError::Failed("interrupted".into()));
+                Ok(TrackDownloadResult::Error { error }) => {
+                    Next::Retry(format!("lucida error: {error}"))
                 }
+                Err(_) => Next::Retry("invalid job response".into()),
             }
-        } else {
-            tracing::warn!(
-                "received code {} when requesting track download",
-                status.as_u16()
-            );
-            last_error = format!("job request returned HTTP {status}");
-
-            if !running.load(Ordering::Relaxed) {
-                return Err(JobError::Failed("interrupted".into()));
-            }
-        }
-    }
-    Err(JobError::Failed(last_error))
+        },
+    )
+    .await
+    .unwrap_or_else(|error| Err(JobError::Failed(error)))
 }
 
 pub async fn track_download_status(
     client: &Client,
     stream: &TrackDownload,
+    running: &AtomicBool,
 ) -> Option<TrackDownloadStatus> {
-    for attempt in 0..3 {
-        if attempt > 0 {
-            time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-        }
-        let response = client
-            .get(format!(
-                "https://{}.lucida.to/api/fetch/request/{}",
-                stream.server, stream.handoff
-            ))
-            .timeout(Duration::from_secs(45))
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!("request failed: {}", error.without_url());
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422) {
-            tracing::info!("request stopped: HTTP {status}");
-            return None;
-        }
-
-        if status == StatusCode::OK {
+    let url = format!(
+        "https://{}.lucida.to/api/fetch/request/{}",
+        stream.server, stream.handoff
+    );
+    with_retries(
+        "status request",
+        running,
+        &DEAD_JOB_STATUS_CODES,
+        || client.get(&url).timeout(Duration::from_secs(45)),
+        |response| async move {
             match response.json().await {
-                Ok(status) => return Some(status),
-                Err(error) => {
-                    tracing::warn!("invalid processing response: {}", error.without_url());
-                    continue;
-                }
+                Ok(status) => Next::Done(status),
+                Err(error) => Next::Retry(format!(
+                    "invalid processing response: {}",
+                    error.without_url()
+                )),
             }
-        }
-
-        tracing::warn!(
-            "received code {} when checking track processing status",
-            status.as_u16()
-        );
-
-        if IRRECOVERABLE_STATUS_CODES.contains(&status) {
-            return None;
-        }
-    }
-    None
+        },
+    )
+    .await
+    .ok()
 }
 
+/// Returns the audio response, ready to stream, and its MIME type.
 pub async fn download_track(
     client: &Client,
     stream: &TrackDownload,
-) -> Option<(Receiver<StreamEvent>, String)> {
+    running: &AtomicBool,
+) -> Option<(Response, String)> {
     download_track_from_url(
         client,
         &format!(
             "https://{}.lucida.to/api/fetch/request/{}/download",
             stream.server, stream.handoff
         ),
+        running,
     )
     .await
 }
@@ -256,151 +222,44 @@ pub async fn download_track(
 async fn download_track_from_url(
     client: &Client,
     url: &str,
-) -> Option<(Receiver<StreamEvent>, String)> {
-    for attempt in 0..3 {
-        if attempt > 0 {
-            time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-        }
-        let response = client.get(url).send().await;
-        let mut response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!("request failed: {}", error.without_url());
-                continue;
-            }
-        };
-
-        let status = response.status();
-        if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422) {
-            tracing::info!("request stopped: HTTP {status}");
-            return None;
-        }
-
-        if status == StatusCode::OK {
-            let Some(mime_type) = response
+    running: &AtomicBool,
+) -> Option<(Response, String)> {
+    with_retries(
+        "audio request",
+        running,
+        &DEAD_JOB_STATUS_CODES,
+        || client.get(url),
+        |response| async move {
+            let mime_type = response
                 .headers()
                 .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-            else {
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            if mime_type.is_none() {
                 tracing::warn!("missing or invalid Content-Type");
-                return None;
-            };
-
-            let (tx, rx) = mpsc::channel(8);
-
-            tokio::spawn(
-                async move {
-                    loop {
-                        let result = response.chunk().await;
-
-                        match result {
-                            Ok(chunk) => {
-                                if let Some(chunk) = chunk {
-                                    if tx.send(StreamEvent::Data(chunk.to_vec())).await.is_err() {
-                                        break;
-                                    }
-                                } else {
-                                    let _ = tx.send(StreamEvent::Finished).await;
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                tracing::info!("error when downloading track audio: {err}");
-                                let _ = tx.send(StreamEvent::Failed).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-                .in_current_span(),
-            );
-
-            return Some((rx, mime_type));
-        }
-
-        tracing::info!(
-            "received code {} when downloading track audio",
-            status.as_u16()
-        );
-
-        if IRRECOVERABLE_STATUS_CODES.contains(&status) {
-            return None;
-        }
-    }
-    None
+            }
+            Next::Done(mime_type.map(|mime_type| (response, mime_type)))
+        },
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
+/// Returns the cover response, ready to stream.
 pub async fn download_album_cover(
     client: &Client,
     url: &str,
-    running: Arc<AtomicBool>,
-) -> Result<Receiver<StreamEvent>, String> {
-    let mut last_error = String::from("no response");
-    for attempt in 0..3 {
-        if attempt > 0 {
-            time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
-        }
-        let response = client.get(url).send().await;
-        let mut response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("cover request failed: {}", error.without_url());
-                tracing::warn!("{last_error}");
-                continue;
-            }
-        };
-        let status = response.status();
-        if matches!(status.as_u16(), 400 | 401 | 403 | 404 | 410 | 422) {
-            tracing::info!("request stopped: HTTP {status}");
-            return Err(format!("cover request returned HTTP {status}"));
-        }
-
-        if status == StatusCode::OK {
-            let (tx, rx) = mpsc::channel(8);
-
-            tokio::spawn(
-                async move {
-                    loop {
-                        let result = response.chunk().await;
-
-                        match result {
-                            Ok(chunk) => {
-                                if let Some(chunk) = chunk {
-                                    if tx.send(StreamEvent::Data(chunk.to_vec())).await.is_err() {
-                                        break;
-                                    }
-                                } else {
-                                    let _ = tx.send(StreamEvent::Finished).await;
-                                    break;
-                                }
-                            }
-                            Err(err) => {
-                                tracing::info!("error when downloading album cover: {err}");
-
-                                let _ = tx.send(StreamEvent::Failed).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-                .in_current_span(),
-            );
-
-            return Ok(rx);
-        }
-
-        last_error = format!("cover request returned HTTP {status}");
-        tracing::info!(
-            "received code {} when downloading album cover from {url}",
-            status.as_u16()
-        );
-
-        if !running.load(Ordering::Relaxed) {
-            return Err("interrupted".into());
-        }
-    }
-    Err(last_error)
+    running: &AtomicBool,
+) -> Result<Response, String> {
+    with_retries(
+        "cover request",
+        running,
+        &[],
+        || client.get(url),
+        |response| async move { Next::Done(response) },
+    )
+    .await
 }
 
 /// Only explicit streaming-availability messages are terminal; unknown errors retry.
@@ -457,7 +316,11 @@ mod http_tests {
             .unwrap();
         let result = time::timeout(
             Duration::from_secs(1),
-            download_track_from_url(&client, &format!("http://{addr}/expired/download")),
+            download_track_from_url(
+                &client,
+                &format!("http://{addr}/expired/download"),
+                &AtomicBool::new(true),
+            ),
         )
         .await
         .expect("404 must return immediately to create a fresh job");
